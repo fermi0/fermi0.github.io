@@ -60,13 +60,16 @@ export default function BlackHoleIntroGate({ children }: BlackHoleIntroGateProps
 
       {/* ── 3-D black hole canvas ───────────────────────────────────────────── */}
       <motion.div
-        className="absolute inset-0 z-0"
+        className="absolute inset-0 z-0 bg-black"
         initial={{ opacity: 0, scale: 1 }}
         animate={{
           opacity: stage === "intro" || stage === "entering" ? 1 : 0,
           scale:   stage === "intro" || stage === "entering" ? 1 : 1.12,
         }}
-        transition={{ duration: 1.65, ease: [0.4, 0, 0.2, 1] }}
+        transition={{ 
+          duration: (stage === "expanding" || stage === "greeting" || stage === "home") ? 3.2 : 1.5,
+          ease: "easeOut"
+        }}
         style={{
           pointerEvents: stage === "intro" || stage === "entering" ? "auto" : "none",
         }}
@@ -144,23 +147,7 @@ export default function BlackHoleIntroGate({ children }: BlackHoleIntroGateProps
           }}
         />
 
-        {/* hot-core flash right after void — orange → fades out */}
-        <motion.div
-          className="pointer-events-none absolute inset-0"
-          initial={{ opacity: 0 }}
-          animate={{
-            opacity: stage === "expanding" ? [0, 0.55, 0] : 0,
-          }}
-          transition={{
-            duration: 1.6,
-            ease: "easeInOut",
-            times: [0, 0.25, 1],
-          }}
-          style={{
-            background:
-              "radial-gradient(ellipse 50% 40% at 50% 50%, rgba(254,200,80,0.45) 0%, rgba(214,93,14,0.15) 50%, rgba(0,0,0,0) 100%)",
-          }}
-        />
+        {/* The 3D Canvas itself now natively cross-fades backwards smoothly. No artificial white mask is needed to hide glitching. */}
 
         {/* ── "Hi" greeting ─────────────────────────────────────────────────── */}
         <motion.div
@@ -174,7 +161,8 @@ export default function BlackHoleIntroGate({ children }: BlackHoleIntroGateProps
           transition={{ duration: 1.1, ease: [0.25, 1, 0.5, 1] }}
           className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center"
         >
-          <h2 className="font-sans text-6xl font-extralight tracking-wider text-[#fbf1c7]/90 md:text-8xl">
+          <h2 className="font-sans text-6xl font-extralight tracking-wider text-[#fbf1c7]/90 md:text-8xl"
+              style={{ textShadow: "0 0 35px rgba(180,210,255,0.25)" }}>
             Hi
           </h2>
         </motion.div>

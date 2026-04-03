@@ -37,13 +37,84 @@ function easeOutQuart(t: number) { return 1 - Math.pow(1 - t, 4); }
 const DISK_POINT_VERT = `
 attribute float size;
 attribute vec3 color;
+attribute float aBaseRadius;
+attribute float aBaseAngle;
+attribute float aSeed;
+attribute float aRespawnR;
+
 varying vec3 vColor;
+
 uniform float uPointScale;
+uniform float uTime;
+uniform float uSuckDistance;
+
 void main() {
   vColor = color;
-  vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+  
+  float r = aBaseRadius;
+  float pullDistance = uSuckDistance * (0.35 + aBaseRadius * 0.02);
+  r -= pullDistance;
+  
+  float currentAngle = aBaseAngle;
+  if (r < 2.58) {
+      float travelRange = aRespawnR - 2.58; 
+      r = aRespawnR - mod((pullDistance - (aBaseRadius - 2.58)), max(travelRange, 0.1));
+      currentAngle += aSeed * 100.0 * floor(pullDistance / max(travelRange, 0.1));
+  }
+
+  float omega = 0.52 + 1.35 / max(r, 0.45);
+  currentAngle += uTime * omega + uSuckDistance * omega * 0.68;
+  
+  float x = cos(currentAngle) * r;
+  float z = sin(currentAngle) * r;
+  
+  float wave = sin(currentAngle * 5.0 + uTime * 1.8 + aSeed) * 0.18 * (1.0 / max(r, 1.0));
+  float y = wave + cos(currentAngle * 3.0 + uTime * 1.2 + aSeed * 2.0) * 0.08;
+  
+  vec3 pos = vec3(x, y, z);
+  vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
+  
+  // Gravitational Lensing (Einstein Ring effect)
+  vec4 centerMv = modelViewMatrix * vec4(0.0, 0.0, 0.0, 1.0);
+  vec3 localView = mvPosition.xyz - centerMv.xyz;
+  
+  if (localView.z < 0.0) {
+     float dXY = length(localView.xy);
+     float R = 2.45; 
+     float push = (R * R) / max(dXY, 0.01) * 0.45; 
+     float falloff = smoothstep(-25.0, 0.0, localView.z);
+     localView.xy += normalize(localView.xy + vec2(0.0001)) * push * falloff;
+     mvPosition.xyz = centerMv.xyz + localView;
+     mvPosition.z = max(mvPosition.z, centerMv.z + 0.1);
+  }
+
+  // ── DOPPLER BEAMING ────────────────────────────────────────────────────────
+  // Calculate relative orbital velocity and its projection to the camera
+  vec3 velDir = normalize(vec3(-z, 0.0, x));
+  vec3 viewVel = (modelViewMatrix * vec4(velDir, 0.0)).xyz;
+  vec3 viewDir = normalize(-mvPosition.xyz);
+  
+  float dopplerShift = dot(normalize(viewVel), viewDir);
+  float beamInfluence = smoothstep(-1.0, 1.0, dopplerShift); // 0.0 receding to 1.0 approaching
+  
+  vec3 lColor = vColor;
+  float boost = mix(0.15, 2.0, beamInfluence); // Mellow down brightness
+  lColor *= boost;
+  
+  // White/Blue super-shift for the leading relativistic edge
+  float blueShift = smoothstep(0.7, 1.0, beamInfluence) * 0.65; // Mellow blue
+  lColor += vec3(0.2, 0.5, 0.8) * blueShift * boost;
+  
+  // Deep redshift for retreating edge
+  float redShift = smoothstep(0.3, 0.0, beamInfluence) * 0.55;
+  lColor += vec3(0.8, 0.1, 0.0) * redShift;
+  
+  vColor = min(lColor, vec3(1.8)); // HDR clamping to avoid blowout
+
   float d = -mvPosition.z;
   float s = size * uPointScale * (420.0 / max(d, 0.75));
+  s *= mix(0.8, 1.3, beamInfluence); // Mellow size blooming
+  
   gl_PointSize = clamp(s, 1.0, 128.0);
   gl_Position = projectionMatrix * mvPosition;
 }
@@ -55,7 +126,9 @@ void main() {
   float r2 = dot(c, c);
   if (r2 > 1.0) discard;
   float edge = smoothstep(1.0, 0.25, r2);
-  gl_FragColor = vec4(vColor, 0.86 * edge);
+  // Extremely low alpha (0.05) to accommodate the unprecedented 10 MILLION overlapping particles.
+  // This turns distinct white points into beautifully smooth translucent plasma fog, cutting out brightness blowout.
+  gl_FragColor = vec4(vColor, 0.05 * edge);
 }
 `;
 
@@ -99,36 +172,7 @@ function drawSpeedOverlay(
   const maxR = Math.max(1, Math.hypot(cx, cy));
 
   // ── radial streak lines (optimized: no gradients, no per-frame Math.random) ──
-  const streakMax = 160;
-  const streaks = Math.max(1, Math.round(intensity * streakMax));
-  const r0 = intensity * 30;
-  const r1 = 0.72 * maxR;
-
-  ctx.save();
-  ctx.globalCompositeOperation = "lighter";
-  ctx.lineCap = "round";
-  ctx.strokeStyle = "rgb(254,128,25)";
-
-  for (let i = 0; i < streaks; i++) {
-    const angle = (i / streaks) * Math.PI * 2;
-    const x0 = cx + Math.cos(angle) * r0;
-    const y0 = cy + Math.sin(angle) * r0;
-    const x1 = cx + Math.cos(angle) * r1;
-    const y1 = cy + Math.sin(angle) * r1;
-
-    // deterministic variation so we still look “alive” without allocations
-    const u = (i * 0.61803398875) % 1; // pseudo-random in [0,1)
-    const alpha = intensity * (0.06 + u * 0.10) * (0.35 + voidPull * 0.65);
-    const lw = 0.7 + u * 1.2;
-
-    ctx.globalAlpha = alpha;
-    ctx.lineWidth = lw;
-    ctx.beginPath();
-    ctx.moveTo(x0, y0);
-    ctx.lineTo(x1, y1);
-    ctx.stroke();
-  }
-  ctx.restore();
+  // (Removed speed lines as per user request to avoid arcade/sci-fi visuals in favor of realism)
 
   // ── single speed ring (cheap) ───────────────────────────────────────────────
   if (intensity > 0.22) {
@@ -148,23 +192,27 @@ function drawSpeedOverlay(
   // ── centre bright hot-spot (approaching singularity) ─────────────────────
   if (intensity > 0.4) {
     const hot = (intensity - 0.4) / 0.6;
-    const hg = ctx.createRadialGradient(cx, cy, 0, cx, cy, 160 * hot);
-    hg.addColorStop(0, `rgba(255,255,240,${hot * 0.55})`);
-    hg.addColorStop(0.3, `rgba(254,200,80,${hot * 0.25})`);
+    // Photon ring / singularity corona flash right before darkness
+    const hg = ctx.createRadialGradient(cx, cy, 0, cx, cy, 280 * hot);
+    
+    // Core blueshifts fiercely as voidPull dominates, representing trapped ultra-highenergy photons
+    const isBlue = voidPull > 0.2 ? 1.0 : 0.0;
+    const shift = Math.pow(Math.min(1.0, voidPull * 2.0), 3.0);
+    const gCol = 200 + shift * 55;
+    const bCol = 80 + shift * 175;
+
+    hg.addColorStop(0, `rgba(255,255,255,${hot * 0.9})`);
+    hg.addColorStop(0.3, `rgba(254,${gCol},${bCol},${hot * 0.45})`);
     hg.addColorStop(1, "rgba(0,0,0,0)");
     ctx.fillStyle = hg;
     ctx.beginPath();
-    ctx.arc(cx, cy, 160 * hot, 0, Math.PI * 2);
+    ctx.arc(cx, cy, 280 * hot, 0, Math.PI * 2);
     ctx.fill();
   }
 
-  // ── void black crush (final pull into darkness) ───────────────────────────
+  // ── terminal ambient plasma glow (final pull into the portal) ────────────────
   if (voidPull > 0) {
-    const vg = ctx.createRadialGradient(cx, cy, 0, cx, cy, Math.max(cx, cy) * 1.5);
-    vg.addColorStop(0,   `rgba(0,0,0,0)`);
-    vg.addColorStop(0.3, `rgba(0,0,0,${voidPull * 0.5})`);
-    vg.addColorStop(1,   `rgba(0,0,0,${voidPull})`);
-    ctx.fillStyle = vg;
+    ctx.fillStyle = `rgba(180, 210, 255, ${voidPull * 0.45})`;
     ctx.fillRect(0, 0, W, H);
   }
 }
@@ -225,7 +273,7 @@ export function BlackHoleScene({ stage, onEntered }: BlackHoleSceneProps) {
 
     const horizon = new THREE.Mesh(
       new THREE.SphereGeometry(2.45, 72, 72),
-      new THREE.MeshBasicMaterial({ color: 0x000000 }),
+      new THREE.MeshBasicMaterial({ color: 0x000000, side: THREE.DoubleSide }),
     );
     scene.add(horizon);
 
@@ -245,39 +293,46 @@ export function BlackHoleScene({ stage, onEntered }: BlackHoleSceneProps) {
       new THREE.Color("#b16286"),
     ];
 
-    // accretion disk — 5× prior density; outer spiral particles are much smaller
-    const diskCount = 460_000;
+    // accretion disk — 8.5 MILLION points via GPU! True hyper-fluid density.
+    const diskCount = 8500000;
     const R_DISK_MIN = 2.65;
     const R_DISK_MAX = 12.15;
     const dPos = new Float32Array(diskCount * 3);
     const dCol = new Float32Array(diskCount * 3);
+    const dBaseR = new Float32Array(diskCount);
+    const dBaseA = new Float32Array(diskCount);
     const dSeed = new Float32Array(diskCount);
     const dRespawnR = new Float32Array(diskCount);
-    const dRespawnA = new Float32Array(diskCount);
     const dSize = new Float32Array(diskCount);
     for (let i = 0; i < diskCount; i++) {
-      // bias samples toward outer radii so the spiral edge feels “filled”
       const u = Math.pow(Math.random(), 0.52);
       const r = R_DISK_MIN + u * (R_DISK_MAX - R_DISK_MIN);
       const a = Math.random() * Math.PI * 2;
-      dPos[i*3]   = Math.cos(a) * r;
-      dPos[i*3+1] = (Math.random() - 0.5) * 0.28 * (1 / Math.max(r, 0.6));
-      dPos[i*3+2] = Math.sin(a) * r;
+      dPos[i*3] = 0; dPos[i*3+1] = 0; dPos[i*3+2] = 0;
       const c = palette[Math.floor(Math.random() * palette.length)];
       dCol[i*3]=c.r; dCol[i*3+1]=c.g; dCol[i*3+2]=c.b;
+      dBaseR[i] = r;
+      dBaseA[i] = a;
       dSeed[i] = Math.random() * Math.PI * 2;
       dRespawnR[i] = 9 + Math.random() * 7;
-      dRespawnA[i] = Math.random() * Math.PI * 2;
       const edge = (r - R_DISK_MIN) / (R_DISK_MAX - R_DISK_MIN);
-      // inner bright specks → outer dust (much tinier)
-      dSize[i] = THREE.MathUtils.lerp(0.026, 0.0028, Math.pow(edge, 0.95));
+      // Extremely tiny sizes to prevent 10M particles from blowing out the screen
+      dSize[i] = THREE.MathUtils.lerp(0.006, 0.0006, Math.pow(edge, 0.95)); 
     }
     const diskGeo = new THREE.BufferGeometry();
     diskGeo.setAttribute("position", new THREE.BufferAttribute(dPos, 3));
     diskGeo.setAttribute("color",    new THREE.BufferAttribute(dCol, 3));
+    diskGeo.setAttribute("aBaseRadius", new THREE.BufferAttribute(dBaseR, 1));
+    diskGeo.setAttribute("aBaseAngle", new THREE.BufferAttribute(dBaseA, 1));
+    diskGeo.setAttribute("aSeed", new THREE.BufferAttribute(dSeed, 1));
+    diskGeo.setAttribute("aRespawnR", new THREE.BufferAttribute(dRespawnR, 1));
     diskGeo.setAttribute("size",     new THREE.BufferAttribute(dSize, 1));
     const diskMat = new THREE.ShaderMaterial({
-      uniforms: { uPointScale: { value: 1.05 } },
+      uniforms: { 
+        uPointScale: { value: 1.05 },
+        uTime: { value: 0 },
+        uSuckDistance: { value: 0 }
+      },
       vertexShader: DISK_POINT_VERT,
       fragmentShader: DISK_POINT_FRAG,
       transparent: true,
@@ -287,29 +342,37 @@ export function BlackHoleScene({ stage, onEntered }: BlackHoleSceneProps) {
     const disk = new THREE.Points(diskGeo, diskMat);
     scene.add(disk);
 
-    // inner mist — 5× prior count, slightly smaller points
-    const mistCount = 130_000;
+    // inner mist — Massively increased GPU mist density (1.5M)
+    const mistCount = 1500000;
     const mPos = new Float32Array(mistCount * 3);
     const mCol = new Float32Array(mistCount * 3);
+    const mBaseR = new Float32Array(mistCount);
+    const mBaseA = new Float32Array(mistCount);
+    const mSeed = new Float32Array(mistCount);
     const mRespawnR = new Float32Array(mistCount);
-    const mRespawnA = new Float32Array(mistCount);
+    const mSize = new Float32Array(mistCount);
     for (let i = 0; i < mistCount; i++) {
       const r = 2.55 + Math.random() * 3.2;
       const a = Math.random() * Math.PI * 2;
-      mPos[i*3]=Math.cos(a)*r; mPos[i*3+1]=(Math.random()-0.5)*0.12; mPos[i*3+2]=Math.sin(a)*r;
+      mPos[i*3] = 0; mPos[i*3+1] = 0; mPos[i*3+2] = 0;
       const c = palette[Math.floor(Math.random()*palette.length)];
       mCol[i*3]=c.r*1.1; mCol[i*3+1]=c.g*1.1; mCol[i*3+2]=c.b*1.1;
+      mBaseR[i] = r;
+      mBaseA[i] = a;
+      mSeed[i] = Math.random() * Math.PI * 2;
       mRespawnR[i] = 4.5 + Math.random() * 2;
-      mRespawnA[i] = Math.random() * Math.PI * 2;
+      mSize[i] = Math.random() * 0.004 + 0.001; // Scaled down for density
     }
     const mistGeo = new THREE.BufferGeometry();
     mistGeo.setAttribute("position", new THREE.BufferAttribute(mPos, 3));
     mistGeo.setAttribute("color",    new THREE.BufferAttribute(mCol, 3));
-    const mistMat = new THREE.PointsMaterial({
-      size: 0.012, vertexColors: true, transparent: true, opacity: 0.52,
-      depthWrite: false, blending: THREE.AdditiveBlending, sizeAttenuation: true,
-    });
-    const mist = new THREE.Points(mistGeo, mistMat);
+    mistGeo.setAttribute("aBaseRadius", new THREE.BufferAttribute(mBaseR, 1));
+    mistGeo.setAttribute("aBaseAngle", new THREE.BufferAttribute(mBaseA, 1));
+    mistGeo.setAttribute("aSeed", new THREE.BufferAttribute(mSeed, 1));
+    mistGeo.setAttribute("aRespawnR", new THREE.BufferAttribute(mRespawnR, 1));
+    mistGeo.setAttribute("size", new THREE.BufferAttribute(mSize, 1));
+    // Re-use identical Material and Program to eliminate context switching and double shader compilation
+    const mist = new THREE.Points(mistGeo, diskMat);
     scene.add(mist);
 
     // stars
@@ -361,14 +424,15 @@ export function BlackHoleScene({ stage, onEntered }: BlackHoleSceneProps) {
     let rafId = 0;
     let hasEntered = false;
     let enterAccum = 0;
+    let suckDistanceAccum = 0;
 
     // Interaction / shaking state
     let prevStage = stageRef.current;
     let enteringKick = 0; // 0→1 right after cross event horizon
-    let touchNx = 0;      // -1→1 (last pointer — mouse hover or touch)
+    let touchNx = 0;      
     let touchNy = 0;
-    let touchStrength = 0; // press / drag strength
-    let mouseHover = 0;    // mouse “pointing” near centre (no click)
+    let touchStrength = 0; 
+    let mouseHover = 0;    
     let pointerActive = false;
     let pointerId: number | null = null;
 
@@ -381,8 +445,9 @@ export function BlackHoleScene({ stage, onEntered }: BlackHoleSceneProps) {
         if (s === "entering") enteringKick = 1;
         prevStage = s;
       }
-      if (s === "pre-intro" || s === "home") return;
-      if (s !== "intro" && s !== "entering") return;
+      // We no longer abort the WebGL render loop during pre-intro!
+      // This forces the shader to compile instantly in the background, eliminating the massive lag spike when clicking 'initialize sequence'.
+      if (s === "home") return; 
 
       const delta   = timer.getDelta();
       const elapsed = timer.getElapsed();
@@ -395,82 +460,17 @@ export function BlackHoleScene({ stage, onEntered }: BlackHoleSceneProps) {
       stars.rotation.x -= delta * 0.004;
 
       // ── disk / mist physics ────────────────────────────────────────────────
-      const posAttr  = diskGeo.attributes.position as THREE.BufferAttribute;
-      const mistAttr = mistGeo.attributes.position as THREE.BufferAttribute;
-
-      // sucking speed multiplier (ramps up sharply at the end)
+      // Advanced GLSL GPU Shader replaces all independent CPU array evaluations!
       let suckMult = 1;
       if (s === "entering") {
         const t = Math.min(1, enterAccum / ENTER_SECONDS);
-        suckMult = 1 + easeInCubic(t) * 18; // 1× → 19× pull rate
+        suckMult = 1 + easeInCubic(t) * 18; 
       }
+      suckDistanceAccum += delta * suckMult;
 
-      // combined pointer influence: hover (mouse) + press/drag — scaled by INTERACTION_GAIN
-      const influence = Math.max(mouseHover, touchStrength);
-
-      for (let i = 0; i < diskCount; i++) {
-        let x = posAttr.array[i*3], z = posAttr.array[i*3+2];
-        let r = Math.sqrt(x*x + z*z);
-        let angle = Math.atan2(z, x);
-        const omega = (0.52 + 1.35 / Math.max(r, 0.45)) * (s === "entering" ? suckMult * 0.68 : 1);
-        angle += delta * omega;
-        r -= delta * (0.22 + r * 0.018) * suckMult;
-        if (r < 2.58) {
-          r = dRespawnR[i];
-          angle = dRespawnA[i] + dSeed[i] * 0.08;
-        }
-        let cosA = Math.cos(angle);
-        let sinA = Math.sin(angle);
-
-        if (influence > 0.0001) {
-          const align = Math.max(0, touchNx * cosA + touchNy * sinA);
-          const tf = influence * align * INTERACTION_GAIN;
-          angle += delta * tf * 0.88; // tangential flow (gain applied via INTERACTION_GAIN)
-          r     -= delta * tf * (s === "entering" ? 0.072 : 0.048);
-          // `angle` changed above; recompute for correct final position
-          cosA = Math.cos(angle);
-          sinA = Math.sin(angle);
-        }
-        const wave =
-          Math.sin(angle*5 + elapsed*1.8 + dSeed[i]) *
-          0.18 *
-          (1 / Math.max(r, 1)) *
-          (1 + influence * 0.22);
-        const y = wave + Math.cos(angle*3 + elapsed*1.2 + dSeed[i]*2) * 0.08;
-        posAttr.array[i*3]   = cosA * r;
-        posAttr.array[i*3+1] = y;
-        posAttr.array[i*3+2] = sinA * r;
-      }
-      posAttr.needsUpdate = true;
-
-      for (let i = 0; i < mistCount; i++) {
-        let x = mistAttr.array[i*3], z = mistAttr.array[i*3+2];
-        let r = Math.sqrt(x*x + z*z);
-        let angle = Math.atan2(z, x);
-        angle += delta * (0.86 + 2.1 / Math.max(r, 0.35)) * (s === "entering" ? suckMult * 0.78 : 1);
-        r -= delta * (0.35 + r * 0.04) * suckMult;
-        if (r < 2.52) {
-          r = mRespawnR[i];
-          angle = mRespawnA[i];
-        }
-        let cosA = Math.cos(angle);
-        let sinA = Math.sin(angle);
-
-        if (influence > 0.0001) {
-          const align = Math.max(0, touchNx * cosA + touchNy * sinA);
-          const tf = influence * align * INTERACTION_GAIN;
-          angle += delta * tf * 0.72;
-          r     -= delta * tf * (s === "entering" ? 0.060 : 0.042);
-          // `angle` changed above; recompute for correct final position
-          cosA = Math.cos(angle);
-          sinA = Math.sin(angle);
-        }
-        const y = Math.sin(angle*8 + elapsed*2.5 + i*0.01) * 0.06 * (1 / Math.max(r, 1));
-        mistAttr.array[i*3]   = cosA * r;
-        mistAttr.array[i*3+1] = y;
-        mistAttr.array[i*3+2] = sinA * r;
-      }
-      mistAttr.needsUpdate = true;
+      diskMat.uniforms.uTime.value = elapsed;
+      diskMat.uniforms.uSuckDistance.value = suckDistanceAccum;
+      // mist utilizes the exact same diskMat instance natively!
 
       disk.rotation.y  += delta * 0.31;
       disk.rotation.z  += delta * 0.065;
@@ -491,19 +491,33 @@ export function BlackHoleScene({ stage, onEntered }: BlackHoleSceneProps) {
         const phase2 = Math.max(0, (t - 0.52) / 0.48);
         const snapE  = easeInOutCubic(phase2);
 
-        const tz = easeInOutQuint(t);
-        camera.position.z = THREE.MathUtils.lerp(15, 0.18, easeOutQuart(tz));
-        camera.position.x =
-          Math.sin(t * Math.PI * 3.1) * 1.25 * (1 - snapE * 0.85) * (1 - easeOutQuart(t) * 0.55);
-        camera.position.y =
-          THREE.MathUtils.lerp(3, 0.05, e) +
-          Math.cos(t * Math.PI * 3.6) * 0.42 * (1 - snapE);
+        // Dizzying vortex spin on the Z-axis (Tidal forces returning, but smoothly scaled)
+        const rollAngle = easeInCubic(t / 0.9) * Math.PI * 12.0; 
+        camera.up.set(Math.sin(rollAngle), Math.cos(rollAngle), 0);
 
-        // ── subtle camera shake (always gentle) ─────────────────────────────
+        // Keplerian Spiral Dive
+        const tz = easeInOutQuint(t);
+        const plungeRadius = THREE.MathUtils.lerp(15, 0.18, easeOutQuart(tz));
+        const orbitA = elapsed * 0.45 + Math.pow(t, 2.5) * Math.PI * 5.0; // Rapidly escalating orbit speed
+
+        // Seamless bridge from the passive X=3.1/Z=15 viewing ellipse into the pure centered gravity well
+        const xRadius = THREE.MathUtils.lerp(3.1, plungeRadius, e);
+        const zRadius = THREE.MathUtils.lerp(15, plungeRadius, e);
+        
+        camera.position.x = Math.sin(orbitA) * xRadius;
+        camera.position.y = THREE.MathUtils.lerp(2 + Math.cos(elapsed * 0.28) * 1.4, 0.05, e) + Math.cos(t * Math.PI * 3.6) * 0.42 * (1 - snapE);
+        camera.position.z = Math.cos(orbitA) * zRadius;
+
+        // The absolute mass of the singularity physically scales out directly into the viewport
+        const horizonScale = 1.0 + Math.pow(t, 14.0) * 1.85;
+        horizon.scale.setScalar(horizonScale);
+
+        // ── Violent camera shake at the precipice ───────────────────────────
         const interact = Math.max(mouseHover, touchStrength);
         const shakeBase =
           kick * 0.038 +
-          interact * 0.032;
+          interact * 0.032 +
+          Math.pow(t, 8.0) * 1.2; // Massive violent shaking right before the snap
         if (shakeBase > 0.00005) {
           const sx = Math.sin(elapsed * 7.1);
           const sy = Math.cos(elapsed * 8.4);
@@ -511,8 +525,8 @@ export function BlackHoleScene({ stage, onEntered }: BlackHoleSceneProps) {
           camera.position.y += (sy * 0.10 + touchNy * 0.08) * shakeBase;
         }
 
-        // ── FOV warp (fish-eye suck effect) ────────────────────────────────
-        camera.fov = 55 + easeInOutCubic(t) * 42; // smoother than cubic-in only
+        // ── Hyper FOV warp (Spaghettification suck effect) ─────────────────
+        camera.fov = 55 + easeInCubic(t) * 115; // Ramps out to 170+ FOV drastically!
         camera.updateProjectionMatrix();
 
         camera.lookAt(0, 0, 0);
@@ -545,6 +559,8 @@ export function BlackHoleScene({ stage, onEntered }: BlackHoleSceneProps) {
         camera.position.x = Math.sin(elapsed * 0.45) * 3.1;
         camera.position.y = 2 + Math.cos(elapsed * 0.28) * 1.4;
         camera.position.z = 15;
+        camera.up.set(0, 1, 0); // Restore stable Z axis
+        horizon.scale.setScalar(1.0); // True physics bounds
         camera.fov = 55;
         camera.updateProjectionMatrix();
         camera.lookAt(0, 0, 0);
@@ -616,7 +632,7 @@ export function BlackHoleScene({ stage, onEntered }: BlackHoleSceneProps) {
       if (nebulaTex) nebulaTex.dispose();
       // dispose geometries / materials
       [diskGeo, mistGeo, starsGeo].forEach(g => g.dispose());
-      [diskMat, mistMat, starsMat, ringMat].forEach(m => m.dispose());
+      [diskMat, starsMat, ringMat].forEach(m => m.dispose());
       horizon.geometry.dispose(); (horizon.material as THREE.Material).dispose();
       ring.geometry.dispose();
       if (nebula) { nebula.geometry.dispose(); (nebula.material as THREE.Material).dispose(); }
