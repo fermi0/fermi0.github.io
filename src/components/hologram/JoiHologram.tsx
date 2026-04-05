@@ -246,6 +246,14 @@ export default function JoiHologram() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const [ready, setReady] = useState(false);
+  const [isMobile, setIsMobile] = useState(false);
+
+  useEffect(() => {
+    setIsMobile(window.innerWidth <= 768);
+    const handleResizeCheck = () => setIsMobile(window.innerWidth <= 768);
+    window.addEventListener("resize", handleResizeCheck);
+    return () => window.removeEventListener("resize", handleResizeCheck);
+  }, []);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -409,7 +417,10 @@ export default function JoiHologram() {
         <canvas 
            ref={canvasRef} 
            className="absolute inset-0 h-full w-full" 
-           style={{ objectFit: "contain", objectPosition: "right bottom" }} 
+           style={{ 
+             objectFit: isMobile ? "cover" : "contain", 
+             objectPosition: isMobile ? "center" : "right bottom" 
+           }} 
         />
 
       </div>

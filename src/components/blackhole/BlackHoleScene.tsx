@@ -120,15 +120,15 @@ void main() {
 }
 `;
 const DISK_POINT_FRAG = `
+uniform float uAlphaMult;
 varying vec3 vColor;
 void main() {
   vec2 c = gl_PointCoord * 2.0 - 1.0;
   float r2 = dot(c, c);
   if (r2 > 1.0) discard;
   float edge = smoothstep(1.0, 0.25, r2);
-  // Extremely low alpha (0.05) to accommodate the unprecedented 10 MILLION overlapping particles.
-  // This turns distinct white points into beautifully smooth translucent plasma fog, cutting out brightness blowout.
-  gl_FragColor = vec4(vColor, 0.05 * edge);
+  // Base alpha is dynamically compensated if mobile particle counts are decimated
+  gl_FragColor = vec4(vColor, 0.05 * uAlphaMult * edge);
 }
 `;
 
@@ -248,12 +248,14 @@ export function BlackHoleScene({ stage, onEntered }: BlackHoleSceneProps) {
     );
     camera.position.set(0, 3, 15);
 
+    const isMobile = window.innerWidth <= 768;
+
     const renderer = new THREE.WebGLRenderer({
       alpha: true, antialias: false, powerPreference: "high-performance",
     });
     renderer.setSize(window.innerWidth, window.innerHeight);
-    // cap pixel ratio for buttery smooth motion
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+    // Hard cap standard mobile devices to 1.5 dpr to save massive shader pixel evaluation layout
+    renderer.setPixelRatio(isMobile ? Math.min(window.devicePixelRatio, 1.5) : window.devicePixelRatio);
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.05;
@@ -286,7 +288,9 @@ export function BlackHoleScene({ stage, onEntered }: BlackHoleSceneProps) {
     ];
 
     // accretion disk — 8.5 MILLION points via GPU! True hyper-fluid density.
-    const diskCount = 8500000;
+    // ── particle systems (Massively scaled back for Mobile devices) ──────
+    const P_MULT = isMobile ? 0.08 : 1.0;
+    const diskCount = Math.floor(8_500_000 * P_MULT);
     const R_DISK_MIN = 2.65;
     const R_DISK_MAX = 12.15;
     const dPos = new Float32Array(diskCount * 3);
@@ -321,9 +325,10 @@ export function BlackHoleScene({ stage, onEntered }: BlackHoleSceneProps) {
     diskGeo.setAttribute("size",     new THREE.BufferAttribute(dSize, 1));
     const diskMat = new THREE.ShaderMaterial({
       uniforms: { 
-        uPointScale: { value: 1.05 },
+        uPointScale: { value: isMobile ? 1.4 : 1.05 }, // Slightly bigger dots on mobile to compensate for coverage
         uTime: { value: 0 },
-        uSuckDistance: { value: 0 }
+        uSuckDistance: { value: 0 },
+        uAlphaMult: { value: isMobile ? 5.0 : 1.0 } // Increases exposure 5x when particles drop to 8% density
       },
       vertexShader: DISK_POINT_VERT,
       fragmentShader: DISK_POINT_FRAG,
@@ -334,8 +339,8 @@ export function BlackHoleScene({ stage, onEntered }: BlackHoleSceneProps) {
     const disk = new THREE.Points(diskGeo, diskMat);
     scene.add(disk);
 
-    // inner mist — Massively increased GPU mist density (1.5M)
-    const mistCount = 1500000;
+    // inner mist 
+    const mistCount = Math.floor(1_500_000 * P_MULT);
     const mPos = new Float32Array(mistCount * 3);
     const mCol = new Float32Array(mistCount * 3);
     const mBaseR = new Float32Array(mistCount);
@@ -368,7 +373,7 @@ export function BlackHoleScene({ stage, onEntered }: BlackHoleSceneProps) {
     scene.add(mist);
 
     // ── rotated plasma mist ring ─────────────────────────────────────────────
-    const ringCount = 100000;
+    const ringCount = Math.floor(100_000 * P_MULT);
     const rPos = new Float32Array(ringCount * 3);
     const rCol = new Float32Array(ringCount * 3);
     const rBaseR = new Float32Array(ringCount);
@@ -401,7 +406,7 @@ export function BlackHoleScene({ stage, onEntered }: BlackHoleSceneProps) {
     scene.add(pRing);
 
     // stars
-    const starsTotal = 26_000;
+    const starsTotal = Math.floor(26_000 * (isMobile ? 0.35 : 1.0));
     const sPos = new Float32Array(starsTotal * 3);
     const sCol = new Float32Array(starsTotal * 3);
     for (let i = 0; i < starsTotal; i++) {
