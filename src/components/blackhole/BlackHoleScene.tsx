@@ -16,664 +16,635 @@ type BlackHoleSceneProps = {
   onEntered: () => void;
 };
 
-// ─── timing ──────────────────────────────────────────────────────────────────
-const ENTER_SECONDS = 11;    // longer = smoother suck-in transition
-const ENTER_TRIGGER = 0.82;  // when onEntered fires (just before void snap)
+// ─── Constants ──────────────────────────────────────────────────────────────
+const ENTER_SECONDS = 12;
+const ENTER_TRIGGER = 0.95;
 
-// Pointer → particle coupling (user asked ~5× more responsive)
-const INTERACTION_GAIN = 5;
+// ─── Shaders ─────────────────────────────────────────────────────────────────
 
-// ─── easing ──────────────────────────────────────────────────────────────────
-function easeInCubic(t: number) { return t * t * t; }
-function easeInOutCubic(t: number) {
-  return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
-}
-function easeInOutQuint(t: number) {
-  return t < 0.5 ? 16 * t * t * t * t * t : 1 - Math.pow(-2 * t + 2, 5) / 2;
-}
-function easeOutQuart(t: number) { return 1 - Math.pow(1 - t, 4); }
-
-// ─── disk points shader (per-particle size: tiny at spiral edges) ───────────
-const DISK_POINT_VERT = `
+const DISK_VERT = `
 attribute float size;
 attribute vec3 color;
-attribute float aBaseRadius;
-attribute float aBaseAngle;
+attribute float aAngle;
+attribute float aRadius;
+attribute float aSpeed;
+attribute float aYOffset;
 attribute float aSeed;
-attribute float aRespawnR;
 
 varying vec3 vColor;
+varying float vOpacity;
 
-uniform float uPointScale;
 uniform float uTime;
-uniform float uSuckDistance;
+uniform float uSuck;
+uniform float uPixelRatio;
 
 void main() {
-  vColor = color;
-  
-  float r = aBaseRadius;
-  float pullDistance = uSuckDistance * (0.35 + aBaseRadius * 0.02);
-  r -= pullDistance;
-  
-  float currentAngle = aBaseAngle;
-  if (r < 2.58) {
-      float travelRange = aRespawnR - 2.58; 
-      r = aRespawnR - mod((pullDistance - (aBaseRadius - 2.58)), max(travelRange, 0.1));
-      currentAngle += aSeed * 100.0 * floor(pullDistance / max(travelRange, 0.1));
-  }
-
-  float omega = 0.52 + 1.35 / max(r, 0.45);
-  currentAngle += uTime * omega + uSuckDistance * omega * 0.68;
-  
-  float x = cos(currentAngle) * r;
-  float z = sin(currentAngle) * r;
-  
-  float wave = sin(currentAngle * 5.0 + uTime * 1.8 + aSeed) * 0.18 * (1.0 / max(r, 1.0));
-  float y = wave + cos(currentAngle * 3.0 + uTime * 1.2 + aSeed * 2.0) * 0.08;
-  
-  vec3 pos = vec3(x, y, z);
-  vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
-  
-  // Gravitational Lensing (Einstein Ring effect)
-  vec4 centerMv = modelViewMatrix * vec4(0.0, 0.0, 0.0, 1.0);
-  vec3 localView = mvPosition.xyz - centerMv.xyz;
-  
-  if (localView.z < 0.0) {
-     float dXY = length(localView.xy);
-     float R = 2.45; 
-     float push = (R * R) / max(dXY, 0.01) * 0.45; 
-     float falloff = smoothstep(-25.0, 0.0, localView.z);
-     localView.xy += normalize(localView.xy + vec2(0.0001)) * push * falloff;
-     mvPosition.xyz = centerMv.xyz + localView;
-     mvPosition.z = max(mvPosition.z, centerMv.z + 0.1);
-  }
-
-  // ── DOPPLER BEAMING ────────────────────────────────────────────────────────
-  // Calculate relative orbital velocity and its projection to the camera
-  vec3 velDir = normalize(vec3(-z, 0.0, x));
-  vec3 viewVel = (modelViewMatrix * vec4(velDir, 0.0)).xyz;
-  vec3 viewDir = normalize(-mvPosition.xyz);
-  
-  float dopplerShift = dot(normalize(viewVel), viewDir);
-  float beamInfluence = smoothstep(-1.0, 1.0, dopplerShift); // 0.0 receding to 1.0 approaching
-  
-  vec3 lColor = vColor;
-  float boost = mix(0.15, 2.0, beamInfluence); // Mellow down brightness
-  lColor *= boost;
-  
-  // White/Blue super-shift for the leading relativistic edge
-  float blueShift = smoothstep(0.7, 1.0, beamInfluence) * 0.65; // Mellow blue
-  lColor += vec3(0.2, 0.5, 0.8) * blueShift * boost;
-  
-  // Deep redshift for retreating edge
-  float redShift = smoothstep(0.3, 0.0, beamInfluence) * 0.55;
-  lColor += vec3(0.8, 0.1, 0.0) * redShift;
-  
-  vColor = min(lColor, vec3(1.8)); // HDR clamping to avoid blowout
-
-  float d = -mvPosition.z;
-  float s = size * uPointScale * (420.0 / max(d, 0.75));
-  s *= mix(0.8, 1.3, beamInfluence); // Mellow size blooming
-  
-  gl_PointSize = clamp(s, 1.0, 128.0);
-  gl_Position = projectionMatrix * mvPosition;
-}
-`;
-const DISK_POINT_FRAG = `
-uniform float uAlphaMult;
-varying vec3 vColor;
-void main() {
-  vec2 c = gl_PointCoord * 2.0 - 1.0;
-  float r2 = dot(c, c);
-  if (r2 > 1.0) discard;
-  float edge = smoothstep(1.0, 0.25, r2);
-  // Base alpha is dynamically compensated if mobile particle counts are decimated
-  gl_FragColor = vec4(vColor, 0.05 * uAlphaMult * edge);
-}
-`;
-
-// ─── nebula canvas ───────────────────────────────────────────────────────────
-function makeNebulaTexture() {
-  const canvas = document.createElement("canvas");
-  canvas.width = 512; canvas.height = 512;
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return null;
-  const g = ctx.createRadialGradient(256, 256, 0, 256, 256, 360);
-  g.addColorStop(0,    "rgba(40, 20, 80, 0.35)");
-  g.addColorStop(0.35, "rgba(8, 12, 40, 0.20)");
-  g.addColorStop(0.65, "rgba(2,  4, 12, 0.12)");
-  g.addColorStop(1,    "rgba(0,  0,  0, 0)");
-  ctx.fillStyle = g;
-  ctx.fillRect(0, 0, 512, 512);
-  const tex = new THREE.CanvasTexture(canvas);
-  tex.colorSpace = THREE.SRGBColorSpace;
-  return tex;
-}
-
-// ─── radial‑blur / speed‑streak overlay (CSS canvas, 2‑D) ───────────────────
-function makeSpeedCanvas() {
-  const cvs = document.createElement("canvas");
-  cvs.style.cssText =
-    "position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:5;";
-  return cvs;
-}
-
-function drawSpeedOverlay(
-  cvs: HTMLCanvasElement,
-  intensity: number,   // 0→1
-  voidPull: number,    // 0→1 (near‑end black crush)
-) {
-  const W = cvs.width; const H = cvs.height;
-  const ctx = cvs.getContext("2d")!;
-  ctx.clearRect(0, 0, W, H);
-  if (intensity <= 0 && voidPull <= 0) return;
-
-  const cx = W / 2; const cy = H / 2;
-  const maxR = Math.max(1, Math.hypot(cx, cy));
-
-  // ── radial streak lines (optimized: no gradients, no per-frame Math.random) ──
-  // (Removed speed lines as per user request to avoid arcade/sci-fi visuals in favor of realism)
-
-  // ── single speed ring (cheap) ───────────────────────────────────────────────
-  if (intensity > 0.22) {
-    const ca = (intensity - 0.22) / 0.78;
-    const rr = (maxR * 0.22 + 20) * ca + maxR * 0.02;
-    ctx.save();
-    ctx.globalCompositeOperation = "lighter";
-    ctx.globalAlpha = ca * 0.15 * (0.4 + voidPull * 0.6);
-    ctx.strokeStyle = "rgba(80,200,255,1)";
-    ctx.lineWidth = 1.2 + ca * 2.0;
-    ctx.beginPath();
-    ctx.arc(cx, cy, rr, 0, Math.PI * 2);
-    ctx.stroke();
-    ctx.restore();
-  }
-
-  // ── centre bright hot-spot (approaching singularity) ─────────────────────
-  if (intensity > 0.4) {
-    const hot = (intensity - 0.4) / 0.6;
-    // Photon ring / singularity corona flash right before darkness
-    const hg = ctx.createRadialGradient(cx, cy, 0, cx, cy, 280 * hot);
+    float r = aRadius;
+    float angle = aAngle + uTime * aSpeed * 1.5;
     
-    // Core blueshifts fiercely as voidPull dominates, representing trapped ultra-highenergy photons
-    const isBlue = voidPull > 0.2 ? 1.0 : 0.0;
-    const shift = Math.pow(Math.min(1.0, voidPull * 2.0), 3.0);
-    const gCol = 200 + shift * 55;
-    const bCol = 80 + shift * 175;
+    float suckPower = pow(uSuck, 3.0);
+    r = mix(r, 0.5, suckPower * 0.98);
+    angle += suckPower * 35.0 * (1.0 / max(r - 3.7, 0.1));
 
-    hg.addColorStop(0, `rgba(255,255,255,${hot * 0.9})`);
-    hg.addColorStop(0.3, `rgba(254,${gCol},${bCol},${hot * 0.45})`);
-    hg.addColorStop(1, "rgba(0,0,0,0)");
-    ctx.fillStyle = hg;
-    ctx.beginPath();
-    ctx.arc(cx, cy, 280 * hot, 0, Math.PI * 2);
-    ctx.fill();
-  }
+    float clusterNoise = sin(angle * 7.0 + aSeed + uTime * 1.2) * cos(r * 4.0 - uTime * 0.8);
+    clusterNoise += sin(angle * 14.0 + aSeed * 2.0 - uTime) * 0.18;
+    r += clusterNoise * 0.35; 
+    
+    // Massive 3D Volumetric Thickness
+    float flare = pow(max(r - 3.6, 0.0), 1.3) * 0.22; 
+    float y = aYOffset * max(flare, 0.05);
+    
+    y += sin(angle * 2.0 + uTime * 0.3) * 0.35 * (r / 8.0);
 
-  // ── terminal ambient plasma glow (final pull into the portal) ────────────────
-  if (voidPull > 0) {
-    ctx.fillStyle = `rgba(180, 210, 255, ${voidPull * 0.45})`;
-    ctx.fillRect(0, 0, W, H);
-  }
+    vec3 pos = vec3(cos(angle) * r, y, sin(angle) * r);
+    vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
+    float d = length(mvPosition.xyz);
+    
+    float rs = 4.2; 
+    vec3 screenPos = mvPosition.xyz;
+    if (screenPos.z < 0.0) {
+        float distToCenterXY = length(screenPos.xy);
+        float pull = (rs * rs * 3.8) / max(distToCenterXY, 0.1);
+        screenPos.xy += normalize(screenPos.xy) * pull * smoothstep(0.0, -20.0, screenPos.z);
+        mvPosition.xyz = screenPos;
+        mvPosition.z = max(mvPosition.z, 0.1); 
+    }
+
+    vec3 vel = normalize(vec3(-sin(angle), 0.0, cos(angle)));
+    vec3 viewDir = normalize(-mvPosition.xyz);
+    float doppler = dot(vel, viewDir);
+    
+    vColor = color;
+    float blueShift = smoothstep(0.2, 1.2, doppler);
+    vColor = mix(vColor, vec3(0.55, 0.8, 1.0), blueShift * 0.7);
+    vColor += vec3(0.15, 0.35, 1.0) * pow(blueShift, 3.0) * 1.5;
+    
+    float redShift = smoothstep(-0.2, -1.0, doppler);
+    vColor = mix(vColor, vec3(0.65, 0.1, 0.0), redShift * 0.8);
+    
+    float beaming = pow(max(1.0 + doppler * 0.8, 0.1), 3.0);
+    
+    vOpacity = smoothstep(3.5, 4.2, r) * smoothstep(22.0, 16.0, r); 
+    vOpacity *= beaming;
+    vOpacity *= (1.0 + max(0.0, clusterNoise) * 1.1);
+    vOpacity *= (1.0 - suckPower);
+
+    float pointSize = size * uPixelRatio * (750.0 / max(d, 1.0));
+    pointSize *= mix(0.5, 1.4, smoothstep(-0.5, 0.8, doppler)); 
+    
+    gl_PointSize = clamp(pointSize, 1.0, 180.0);
+    gl_Position = projectionMatrix * mvPosition;
+}
+`;
+
+const DISK_FRAG = `
+varying vec3 vColor;
+varying float vOpacity;
+
+void main() {
+    vec2 c = gl_PointCoord - 0.5;
+    float r2 = dot(c, c);
+    if (r2 > 0.25) discard;
+    
+    float core = exp(-r2 * 22.0);
+    float glow = smoothstep(0.3, 0.0, r2) * 0.6;
+    
+    float finalAlpha = (core + glow) * vOpacity;
+    vec3 hdrColor = vColor * min(finalAlpha * 2.0, 1.4);
+    gl_FragColor = vec4(hdrColor, finalAlpha * 0.85);
+}
+`;
+
+const STARS_VERT = `
+attribute float size;
+attribute vec3 color;
+
+varying vec3 vColor;
+varying float vOpacity;
+
+uniform float uTime;
+uniform float uSuck;
+uniform float uWarpSpeed; 
+uniform float uPixelRatio;
+
+void main() {
+    float suckPower = pow(uSuck, 2.0);
+    vec3 origPos = position;
+    float distToCenter = length(origPos);
+    
+    float drag = suckPower * 45.0 * (1.0 / max(distToCenter, 1.0));
+    float angle = atan(origPos.z, origPos.x); // XZ plane
+    angle += drag;
+    float rXZ = length(origPos.xz);
+    vec3 pos = vec3(cos(angle) * rXZ, origPos.y, sin(angle) * rXZ);
+
+    vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
+    vec3 screenPos = mvPosition.xyz;
+    
+    float orbitalDoppler = dot(normalize(vec3(-sin(angle), 0.0, cos(angle))), normalize(-screenPos)) * min(drag * 6.0, 1.0); 
+    float totalDoppler = orbitalDoppler + uWarpSpeed * 4.0;
+    
+    vec3 outColor = color;
+    
+    if (totalDoppler > 0.0) {
+        outColor = mix(outColor, vec3(0.9, 0.95, 1.0), smoothstep(0.0, 1.0, totalDoppler));
+        outColor = mix(outColor, vec3(0.15, 0.45, 1.0), smoothstep(1.0, 2.5, totalDoppler));
+        outColor = mix(outColor, vec3(0.05, 0.05, 0.8), smoothstep(2.5, 4.0, totalDoppler));
+    } else {
+        outColor = mix(outColor, vec3(1.0, 0.1, 0.0), smoothstep(0.0, -1.5, totalDoppler));
+        outColor = mix(outColor, vec3(0.1, 0.05, 0.0), smoothstep(-1.5, -3.0, totalDoppler));
+    }
+    
+    vColor = outColor;
+    float d = length(screenPos.xy);
+    float rs = 5.2; 
+    float lens = (rs * rs * 2.5) / max(d, 0.1); 
+    mvPosition.xy += normalize(screenPos.xy) * lens * (1.0 + suckPower * 85.0);
+    
+    vOpacity = smoothstep(0.0, 1.0, size) * (1.0 - pow(uSuck, 3.0));
+    
+    // Slight aberration push (no point-stretching)
+    float aberration = uWarpSpeed * max(0.0, 1.0 - (d / 40.0));
+    vOpacity *= 1.0 + aberration * 2.0; 
+    
+    float pointSize = size * uPixelRatio * (600.0 / max(length(mvPosition.xyz), 1.0));
+    gl_PointSize = clamp(pointSize, 0.5, 45.0);
+    gl_Position = projectionMatrix * mvPosition;
+}
+`;
+
+const STARS_FRAG = `
+varying vec3 vColor;
+varying float vOpacity;
+
+void main() {
+    float dist = length(gl_PointCoord - 0.5);
+    if (dist > 0.5) discard;
+    float intensity = exp(-dist * dist * 35.0) + smoothstep(0.5, 0.0, dist) * 0.18;
+    gl_FragColor = vec4(vColor, min(vOpacity * intensity * 1.2, 0.95));
+}
+`;
+
+// ─── Star Trek "Volumetric Plasma Haze" Warp Bubble ─────────────────────────
+// This entirely replaces discrete line streaks with a stunning volumetric mist boundary
+const WARP_BUBBLE_VERT = `
+varying vec3 vLocalPos;
+varying float vZNorm;
+
+void main() {
+    vLocalPos = position; // local sphere coords from -1 to 1
+    vZNorm = position.z;
+    vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+    gl_Position = projectionMatrix * mvPosition;
+}
+`;
+
+const WARP_BUBBLE_FRAG = `
+varying vec3 vLocalPos;
+varying float vZNorm;
+
+uniform float uTime;
+uniform float uWarpSpeed;
+
+// FAST 3D NOISE ALGORITHM FOR VOLUMETRIC HASHING
+vec3 mod289(vec3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+vec4 mod289(vec4 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+vec4 permute(vec4 x) { return mod289(((x*34.0)+1.0)*x); }
+vec4 taylorInvSqrt(vec4 r) { return 1.79284291400159 - 0.85373472095314 * r; }
+float snoise(vec3 v) { 
+  const vec2  C = vec2(1.0/6.0, 1.0/3.0) ;
+  const vec4  D = vec4(0.0, 0.5, 1.0, 2.0);
+  vec3 i  = floor(v + dot(v, C.yyy) );
+  vec3 x0 = v - i + dot(i, C.xxx) ;
+  vec3 g = step(x0.yzx, x0.xyz);
+  vec3 l = 1.0 - g;
+  vec3 i1 = min( g.xyz, l.zxy );
+  vec3 i2 = max( g.xyz, l.zxy );
+  vec3 x1 = x0 - i1 + C.xxx;
+  vec3 x2 = x0 - i2 + C.yyy; 
+  vec3 x3 = x0 - D.yyy;      
+  i = mod289(i); 
+  vec4 p = permute( permute( permute( 
+             i.z + vec4(0.0, i1.z, i2.z, 1.0 ))
+           + i.y + vec4(0.0, i1.y, i2.y, 1.0 )) 
+           + i.x + vec4(0.0, i1.x, i2.x, 1.0 ));
+  float n_ = 0.142857142857; 
+  vec3  ns = n_ * D.wyz - D.xzx;
+  vec4 j = p - 49.0 * floor(p * ns.z * ns.z);  
+  vec4 x_ = floor(j * ns.z);
+  vec4 y_ = floor(j - 7.0 * x_ );    
+  vec4 x = x_ *ns.x + ns.yyyy;
+  vec4 y = y_ *ns.x + ns.yyyy;
+  vec4 h = 1.0 - abs(x) - abs(y);
+  vec4 b0 = vec4( x.xy, y.xy );
+  vec4 b1 = vec4( x.zw, y.zw );
+  vec4 s0 = floor(b0)*2.0 + 1.0;
+  vec4 s1 = floor(b1)*2.0 + 1.0;
+  vec4 sh = -step(h, vec4(0.0));
+  vec4 a0 = b0.xzyw + s0.xzyw*sh.xxyy ;
+  vec4 a1 = b1.xzyw + s1.xzyw*sh.zzww ;
+  vec3 p0 = vec3(a0.xy,h.x);
+  vec3 p1 = vec3(a0.zw,h.y);
+  vec3 p2 = vec3(a1.xy,h.z);
+  vec3 p3 = vec3(a1.zw,h.w);
+  vec4 norm = taylorInvSqrt(vec4(dot(p0,p0), dot(p1,p1), dot(p2, p2), dot(p3,p3)));
+  p0 *= norm.x; p1 *= norm.y; p2 *= norm.z; p3 *= norm.w;
+  vec4 m = max(0.6 - vec4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0);
+  m = m * m;
+  return 42.0 * dot( m*m, vec4( dot(p0,x0), dot(p1,x1), dot(p2,x2), dot(p3,x3) ) );
+}
+float fbm3(vec3 x) {
+    float v = 0.0; float a = 0.5; vec3 shift = vec3(100);
+    for (int i = 0; i < 4; ++i) {
+        v += a * snoise(x);
+        x = x * 2.0 + shift;
+        a *= 0.5;
+    }
+    return v;
 }
 
-// ─── CSS blur helper ──────────────────────────────────────────────────────────
-function setRendererBlur(el: HTMLCanvasElement, px: number) {
-  // Avoid spamming style changes every frame (reduces GPU churn/lag)
-  const anyEl = el as any;
-  const last = typeof anyEl._lastBlurPx === "number" ? (anyEl._lastBlurPx as number) : -1;
-  if (Math.abs(last - px) < 0.15) return;
-  anyEl._lastBlurPx = px;
-  el.style.filter = px > 0.25 ? `blur(${px}px)` : "";
+void main() {
+    if (uWarpSpeed < 0.001) discard; // Strict GPU saver
+    
+    // Front Bow-Shock boundary is vZNorm = -1.0. Back tail is vZNorm = 1.0
+    // We smoothstep tightly against the front to create the bright dome
+    float bowShock = smoothstep(-0.6, -1.0, vZNorm);
+    
+    // Extreme Z stretch mapping to produce long volumetric threads rather than circular clouds
+    float zCoord = vZNorm * 12.0; 
+    
+    // Volumetric Plasma Haze (Base rolling clouds)
+    vec3 hazeCoord = vec3(vLocalPos.x * 3.0, vLocalPos.y * 3.0, zCoord - uTime * 8.0);
+    float haze = fbm3(hazeCoord) * 0.5 + 0.5;
+    
+    // Vibrating Plasma Threads (High frequency, radically stretched in Z)
+    vec3 threadCoord = vec3(vLocalPos.x * 8.0, vLocalPos.y * 8.0, zCoord * 0.05 - uTime * 45.0);
+    float thread1 = fbm3(threadCoord);
+    
+    vec3 threadCoord2 = vec3(vLocalPos.x * 12.0, vLocalPos.y * 12.0, zCoord * 0.02 - uTime * 60.0);
+    float thread2 = fbm3(threadCoord2);
+    
+    // Intersection of threads creates the pulsing jitter weave
+    float threads = pow(max(0.0, thread1 * thread2 * 2.5), 1.2);
+    
+    // ── Star Trek Warp Color Palette ─────────────────────────────
+    vec3 shockWhite = vec3(1.0, 0.98, 0.95);
+    vec3 electricCyan = vec3(0.0, 0.85, 1.0);
+    vec3 deepSapphire = vec3(0.05, 0.1, 0.6);
+    vec3 magentaAberration = vec3(0.8, 0.0, 0.4); // Spectral edge rainbow
+
+    // Base color shift from deep sapphire to electric cyan
+    vec3 color = mix(deepSapphire, electricCyan, haze + threads * 0.5);
+    
+    // Mix in the aberration (Rainbow Halo at edges of screen / periphery)
+    // Distance from center radially
+    float periphery = length(vLocalPos.xy);
+    color = mix(color, magentaAberration, smoothstep(0.7, 1.0, periphery) * uWarpSpeed);
+    
+    // Explode into pure blistering white right at the front bow shock boundary
+    color = mix(color, shockWhite, bowShock + (threads * bowShock * 2.0));
+    
+    // Opacity: Solid at the bow shock, fading out into a gas trailing into the rear
+    float alpha = smoothstep(0.8, -0.5, vZNorm);
+    
+    // Overall Warp State Opacity
+    float warpFade = smoothstep(0.0, 0.3, uWarpSpeed);
+    
+    // Composite HDR intensity
+    float intensity = haze * 0.6 + threads * 1.5 + bowShock * 2.5;
+    
+    gl_FragColor = vec4(color * intensity * 1.8, alpha * intensity * warpFade * min(uWarpSpeed, 1.0));
 }
+`;
+
 
 export function BlackHoleScene({ stage, onEntered }: BlackHoleSceneProps) {
-  const containerRef  = useRef<HTMLDivElement>(null);
-  const stageRef      = useRef(stage);
-  const onEnteredRef  = useRef(onEntered);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const stageRef = useRef(stage);
+  const onEnteredRef = useRef(onEntered);
 
-  useEffect(() => { stageRef.current = stage; },      [stage]);
+  useEffect(() => { stageRef.current = stage; }, [stage]);
   useEffect(() => { onEnteredRef.current = onEntered; }, [onEntered]);
 
   useEffect(() => {
     if (!containerRef.current) return;
 
-    // ── renderer ────────────────────────────────────────────────────────────
+    // ── Setup ────────────────────────────────────────────────────────────────
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x020208);
-    scene.fog = new THREE.FogExp2(0x030510, 0.028);
+    scene.background = new THREE.Color(0x010001);
+    scene.fog = new THREE.FogExp2(0x010001, 0.00065);
 
     const camera = new THREE.PerspectiveCamera(
-      55, window.innerWidth / Math.max(window.innerHeight, 1), 0.1, 500,
+      58, window.innerWidth / window.innerHeight, 0.1, 8000
     );
-    camera.position.set(0, 3, 15);
 
-    const isMobile = window.innerWidth <= 768;
-
-    const renderer = new THREE.WebGLRenderer({
-      alpha: true, antialias: false, powerPreference: "high-performance",
-    });
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: "high-performance" });
     renderer.setSize(window.innerWidth, window.innerHeight);
-    // Hard cap standard mobile devices to 1.5 dpr to save massive shader pixel evaluation layout
-    renderer.setPixelRatio(isMobile ? Math.min(window.devicePixelRatio, 1.5) : window.devicePixelRatio);
-    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.05;
     containerRef.current.appendChild(renderer.domElement);
 
-    // ── 2‑D speed overlay canvas ────────────────────────────────────────────
-    const speedCvs = makeSpeedCanvas();
-    containerRef.current.appendChild(speedCvs);
-    const sizeOverlay = () => {
-      speedCvs.width  = window.innerWidth;
-      speedCvs.height = window.innerHeight;
-    };
-    sizeOverlay();
+    scene.add(camera);
 
-    // ── scene objects ────────────────────────────────────────────────────────
-    scene.add(new THREE.AmbientLight(0xffffff, 0.08));
+    // ── Volumetric Mist Plasma Bubble ───────────────────────────────────────
+    // Completely replaces streak lines with a massive inner-facing spherical dome containing the fog
+    const warpBubbleGeo = new THREE.SphereGeometry(1.0, 64, 64);
+    
+    const warpBubbleMat = new THREE.ShaderMaterial({
+      vertexShader: WARP_BUBBLE_VERT,
+      fragmentShader: WARP_BUBBLE_FRAG,
+      transparent: true,
+      blending: THREE.AdditiveBlending,
+      side: THREE.BackSide, // Renders the inner walls of the bubble
+      depthWrite: false,
+      uniforms: {
+        uTime: { value: 0 },
+        uWarpSpeed: { value: 0 },
+      }
+    });
 
-    const horizon = new THREE.Mesh(
-      new THREE.SphereGeometry(2.45, 72, 72),
-      new THREE.MeshBasicMaterial({ color: 0x000000, side: THREE.DoubleSide }),
-    );
-    scene.add(horizon);
+    const warpBubble = new THREE.Mesh(warpBubbleGeo, warpBubbleMat);
+    // Center it physically forward on the camera so the camera sits near the tail
+    warpBubble.position.set(0, 0, -120); 
+    // Squashing the sphere into a massive 500-unit long pill forming the warp tunnel
+    warpBubble.scale.set(35, 35, 250); 
+    camera.add(warpBubble); 
 
-    // (Yellow photon ring was physically removed as per request for pure geometry scaling)
-
-    const palette = [
-      new THREE.Color("#d65d0e"), new THREE.Color("#fe8019"),
-      new THREE.Color("#fb4934"), new THREE.Color("#fabd2f"),
-      new THREE.Color("#b16286"),
-    ];
-
-    // accretion disk — 8.5 MILLION points via GPU! True hyper-fluid density.
-    // ── particle systems (Massively scaled back for Mobile devices) ──────
-    const P_MULT = isMobile ? 0.08 : 1.0;
-    const diskCount = Math.floor(8_500_000 * P_MULT);
-    const R_DISK_MIN = 2.65;
-    const R_DISK_MAX = 12.15;
+    // ── Accretion Disk (Sgr A* Supermassive core) ────────────────────────────
+    const diskCount = 200000;
+    const diskGeo = new THREE.BufferGeometry();
     const dPos = new Float32Array(diskCount * 3);
     const dCol = new Float32Array(diskCount * 3);
-    const dBaseR = new Float32Array(diskCount);
-    const dBaseA = new Float32Array(diskCount);
-    const dSeed = new Float32Array(diskCount);
-    const dRespawnR = new Float32Array(diskCount);
     const dSize = new Float32Array(diskCount);
+    const dAngle = new Float32Array(diskCount);
+    const dRadii = new Float32Array(diskCount);
+    const dSpeed = new Float32Array(diskCount);
+    const dYOffset = new Float32Array(diskCount);
+    const dSeed = new Float32Array(diskCount);
+
+    const palette = [
+      new THREE.Color("#ff9900"), new THREE.Color("#ff2200"),
+      new THREE.Color("#ffffff"), new THREE.Color("#ffcc66"),
+      new THREE.Color("#1a0300"), 
+    ];
+
     for (let i = 0; i < diskCount; i++) {
-      const u = Math.pow(Math.random(), 0.52);
-      const r = R_DISK_MIN + u * (R_DISK_MAX - R_DISK_MIN);
-      const a = Math.random() * Math.PI * 2;
-      dPos[i*3] = 0; dPos[i*3+1] = 0; dPos[i*3+2] = 0;
-      const c = palette[Math.floor(Math.random() * palette.length)];
-      dCol[i*3]=c.r; dCol[i*3+1]=c.g; dCol[i*3+2]=c.b;
-      dBaseR[i] = r;
-      dBaseA[i] = a;
-      dSeed[i] = Math.random() * Math.PI * 2;
-      dRespawnR[i] = 9 + Math.random() * 7;
-      const edge = (r - R_DISK_MIN) / (R_DISK_MAX - R_DISK_MIN);
-      // Extremely tiny sizes to prevent 10M particles from blowing out the screen
-      dSize[i] = THREE.MathUtils.lerp(0.006, 0.0006, Math.pow(edge, 0.95)); 
+        const u = Math.pow(Math.random(), 2.5);
+        const r = 4.0 + u * 18.0; 
+        const angle = Math.random() * Math.PI * 2;
+
+        dRadii[i] = r;
+        dAngle[i] = angle;
+        dSpeed[i] = 3.5 * Math.pow(r, -1.2); 
+        
+        const u1 = Math.random() + 0.0001; 
+        const u2 = Math.random();
+        const z0 = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
+        dYOffset[i] = (z0 * 0.8) + ((Math.random() - 0.5) * 0.5); 
+        
+        dSeed[i] = Math.random() * 100.0;
+
+        let col;
+        if (r < 4.6) col = palette[2]; 
+        else if (r < 6.5) col = Math.random() > 0.5 ? palette[2] : palette[3]; 
+        else if (r < 10.0) col = palette[0]; 
+        else col = palette[1]; 
+        if (Math.random() > 0.85) col = palette[4];
+
+        dCol[i*3] = col.r; dCol[i*3+1] = col.g; dCol[i*3+2] = col.b;
+        dSize[i] = (1.0 + Math.random() * 4.5) * (col === palette[4] ? 2.8 : 1.0) * (1.1 / Math.pow(r, 0.4));
     }
-    const diskGeo = new THREE.BufferGeometry();
+
     diskGeo.setAttribute("position", new THREE.BufferAttribute(dPos, 3));
-    diskGeo.setAttribute("color",    new THREE.BufferAttribute(dCol, 3));
-    diskGeo.setAttribute("aBaseRadius", new THREE.BufferAttribute(dBaseR, 1));
-    diskGeo.setAttribute("aBaseAngle", new THREE.BufferAttribute(dBaseA, 1));
+    diskGeo.setAttribute("color", new THREE.BufferAttribute(dCol, 3));
+    diskGeo.setAttribute("size", new THREE.BufferAttribute(dSize, 1));
+    diskGeo.setAttribute("aAngle", new THREE.BufferAttribute(dAngle, 1));
+    diskGeo.setAttribute("aRadius", new THREE.BufferAttribute(dRadii, 1));
+    diskGeo.setAttribute("aSpeed", new THREE.BufferAttribute(dSpeed, 1));
+    diskGeo.setAttribute("aYOffset", new THREE.BufferAttribute(dYOffset, 1));
     diskGeo.setAttribute("aSeed", new THREE.BufferAttribute(dSeed, 1));
-    diskGeo.setAttribute("aRespawnR", new THREE.BufferAttribute(dRespawnR, 1));
-    diskGeo.setAttribute("size",     new THREE.BufferAttribute(dSize, 1));
+
     const diskMat = new THREE.ShaderMaterial({
-      uniforms: { 
-        uPointScale: { value: isMobile ? 1.4 : 1.05 }, // Slightly bigger dots on mobile to compensate for coverage
-        uTime: { value: 0 },
-        uSuckDistance: { value: 0 },
-        uAlphaMult: { value: isMobile ? 5.0 : 1.0 } // Increases exposure 5x when particles drop to 8% density
-      },
-      vertexShader: DISK_POINT_VERT,
-      fragmentShader: DISK_POINT_FRAG,
+      vertexShader: DISK_VERT,
+      fragmentShader: DISK_FRAG,
       transparent: true,
-      depthWrite: false,
       blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      uniforms: {
+        uTime: { value: 0 },
+        uSuck: { value: 0 },
+        uPixelRatio: { value: renderer.getPixelRatio() },
+      }
     });
+
     const disk = new THREE.Points(diskGeo, diskMat);
     scene.add(disk);
 
-    // inner mist 
-    const mistCount = Math.floor(1_500_000 * P_MULT);
-    const mPos = new Float32Array(mistCount * 3);
-    const mCol = new Float32Array(mistCount * 3);
-    const mBaseR = new Float32Array(mistCount);
-    const mBaseA = new Float32Array(mistCount);
-    const mSeed = new Float32Array(mistCount);
-    const mRespawnR = new Float32Array(mistCount);
-    const mSize = new Float32Array(mistCount);
-    for (let i = 0; i < mistCount; i++) {
-      const r = 2.55 + Math.random() * 3.2;
-      const a = Math.random() * Math.PI * 2;
-      mPos[i*3] = 0; mPos[i*3+1] = 0; mPos[i*3+2] = 0;
-      const c = palette[Math.floor(Math.random()*palette.length)];
-      mCol[i*3]=c.r*1.1; mCol[i*3+1]=c.g*1.1; mCol[i*3+2]=c.b*1.1;
-      mBaseR[i] = r;
-      mBaseA[i] = a;
-      mSeed[i] = Math.random() * Math.PI * 2;
-      mRespawnR[i] = 4.5 + Math.random() * 2;
-      mSize[i] = Math.random() * 0.004 + 0.001; // Scaled down for density
-    }
-    const mistGeo = new THREE.BufferGeometry();
-    mistGeo.setAttribute("position", new THREE.BufferAttribute(mPos, 3));
-    mistGeo.setAttribute("color",    new THREE.BufferAttribute(mCol, 3));
-    mistGeo.setAttribute("aBaseRadius", new THREE.BufferAttribute(mBaseR, 1));
-    mistGeo.setAttribute("aBaseAngle", new THREE.BufferAttribute(mBaseA, 1));
-    mistGeo.setAttribute("aSeed", new THREE.BufferAttribute(mSeed, 1));
-    mistGeo.setAttribute("aRespawnR", new THREE.BufferAttribute(mRespawnR, 1));
-    mistGeo.setAttribute("size", new THREE.BufferAttribute(mSize, 1));
-    // Re-use identical Material and Program to eliminate context switching and double shader compilation
-    const mist = new THREE.Points(mistGeo, diskMat);
-    scene.add(mist);
+    // ── Event Horizon Shadow ──────────────────────────────────────────────────
+    const horizonGeo = new THREE.SphereGeometry(3.8, 64, 64);
+    const horizonMat = new THREE.MeshBasicMaterial({ color: 0x000000 });
+    const horizon = new THREE.Mesh(horizonGeo, horizonMat);
+    scene.add(horizon);
 
-    // ── rotated plasma mist ring ─────────────────────────────────────────────
-    const ringCount = Math.floor(100_000 * P_MULT);
-    const rPos = new Float32Array(ringCount * 3);
-    const rCol = new Float32Array(ringCount * 3);
-    const rBaseR = new Float32Array(ringCount);
-    const rBaseA = new Float32Array(ringCount);
-    const rSeed = new Float32Array(ringCount);
-    const rRespawnR = new Float32Array(ringCount);
-    const rSize = new Float32Array(ringCount);
-    for (let i = 0; i < ringCount; i++) {
-      const r = 2.52 + Math.pow(Math.random(), 2) * 0.26; 
-      const a = Math.random() * Math.PI * 2;
-      rPos[i*3] = 0; rPos[i*3+1] = 0; rPos[i*3+2] = 0;
-      const c = new THREE.Color().setHSL(0.08 + Math.random()*0.05, 0.9, 0.45 + Math.random()*0.2);
-      rCol[i*3]=c.r*1.1; rCol[i*3+1]=c.g*1.1; rCol[i*3+2]=c.b*1.1;
-      rBaseR[i] = r;
-      rBaseA[i] = a;
-      rSeed[i] = Math.random() * Math.PI * 2;
-      rRespawnR[i] = r;
-      rSize[i] = Math.random() * 0.005 + 0.002;
-    }
-    const ringGeo = new THREE.BufferGeometry();
-    ringGeo.setAttribute("position", new THREE.BufferAttribute(rPos, 3));
-    ringGeo.setAttribute("color",    new THREE.BufferAttribute(rCol, 3));
-    ringGeo.setAttribute("aBaseRadius", new THREE.BufferAttribute(rBaseR, 1));
-    ringGeo.setAttribute("aBaseAngle", new THREE.BufferAttribute(rBaseA, 1));
-    ringGeo.setAttribute("aSeed", new THREE.BufferAttribute(rSeed, 1));
-    ringGeo.setAttribute("aRespawnR", new THREE.BufferAttribute(rRespawnR, 1));
-    ringGeo.setAttribute("size", new THREE.BufferAttribute(rSize, 1));
-    const pRing = new THREE.Points(ringGeo, diskMat);
-    pRing.rotation.x = 0.18;
-    scene.add(pRing);
-
-    // stars
-    const starsTotal = Math.floor(26_000 * (isMobile ? 0.35 : 1.0));
-    const sPos = new Float32Array(starsTotal * 3);
-    const sCol = new Float32Array(starsTotal * 3);
-    for (let i = 0; i < starsTotal; i++) {
-      const r = 45 + Math.pow(Math.random(), 0.55) * 120;
-      const theta = Math.random() * Math.PI * 2;
-      const phi   = Math.acos(2 * Math.random() - 1);
-      sPos[i*3]   = r * Math.sin(phi) * Math.cos(theta);
-      sPos[i*3+1] = r * Math.sin(phi) * Math.sin(theta);
-      sPos[i*3+2] = r * Math.cos(phi);
-      const warm = Math.random() > 0.55;
-      const c = warm
-        ? new THREE.Color().setHSL(0.08 + Math.random()*0.04, 0.35, 0.55 + Math.random()*0.25)
-        : new THREE.Color().setHSL(0.58 + Math.random()*0.12, 0.25, 0.45 + Math.random()*0.35);
-      sCol[i*3]=c.r; sCol[i*3+1]=c.g; sCol[i*3+2]=c.b;
-    }
+    // ── Milky Way Galaxy Background (Bulge, Disc, Halo) ─────────────────────
+    const starCount = 35000;
     const starsGeo = new THREE.BufferGeometry();
+    const sPos = new Float32Array(starCount * 3);
+    const sCol = new Float32Array(starCount * 3);
+    const sSize = new Float32Array(starCount);
+
+    for (let i = 0; i < starCount; i++) {
+      let r, theta, y;
+      const type = Math.random();
+      
+      if (type < 0.45) {
+        r = 15.0 + Math.pow(Math.random(), 2.0) * 120.0;
+        theta = Math.random() * Math.PI * 2;
+        const phi = Math.acos(2 * Math.random() - 1);
+        sPos[i * 3] = r * Math.sin(phi) * Math.cos(theta);
+        sPos[i * 3 + 1] = (r * Math.sin(phi) * Math.sin(theta)) * 0.7; 
+        sPos[i * 3 + 2] = r * Math.cos(phi);
+        
+        const col = new THREE.Color().setHSL(0.1 + Math.random()*0.05, 0.65, 0.35 + Math.random()*0.35);
+        sCol[i*3] = col.r; sCol[i*3+1] = col.g; sCol[i*3+2] = col.b;
+      } else if (type < 0.9) {
+        r = 40.0 + Math.pow(Math.random(), 0.5) * 800.0;
+        theta = Math.random() * Math.PI * 2;
+        sPos[i * 3] = r * Math.cos(theta);
+        y = (Math.random() - 0.5) * (Math.random() + Math.random()) * 35.0 * (1.0 + r/100.0);
+        sPos[i * 3 + 1] = y;
+        sPos[i * 3 + 2] = r * Math.sin(theta);
+        
+        const isBlue = Math.random() > 0.4;
+        const col = isBlue 
+            ? new THREE.Color().setHSL(0.6 + Math.random()*0.1, 0.85, 0.4 + Math.random()*0.4)
+            : new THREE.Color().setHSL(0.05 + Math.random()*0.08, 0.8, 0.35 + Math.random()*0.3);
+        sCol[i*3] = col.r; sCol[i*3+1] = col.g; sCol[i*3+2] = col.b;
+      } else {
+        r = 200.0 + Math.random() * 1200.0;
+        theta = Math.random() * Math.PI * 2;
+        const phi = Math.acos(2 * Math.random() - 1);
+        sPos[i * 3] = r * Math.sin(phi) * Math.cos(theta);
+        sPos[i * 3 + 1] = r * Math.sin(phi) * Math.sin(theta);
+        sPos[i * 3 + 2] = r * Math.cos(phi);
+        
+        sCol[i*3] = 0.8; sCol[i*3+1] = 0.8; sCol[i*3+2] = 0.9;
+      }
+      
+      sSize[i] = Math.random() * 2.8 + 0.5;
+      if (Math.random() > 0.97) sSize[i] *= 4.0;
+    }
+
     starsGeo.setAttribute("position", new THREE.BufferAttribute(sPos, 3));
-    starsGeo.setAttribute("color",    new THREE.BufferAttribute(sCol, 3));
-    const starsMat = new THREE.PointsMaterial({
-      size: 0.055, vertexColors: true, transparent: true, opacity: 0.92,
-      sizeAttenuation: true, depthWrite: false,
+    starsGeo.setAttribute("color", new THREE.BufferAttribute(sCol, 3));
+    starsGeo.setAttribute("size", new THREE.BufferAttribute(sSize, 1));
+
+    const starsMat = new THREE.ShaderMaterial({
+      vertexShader: STARS_VERT,
+      fragmentShader: STARS_FRAG,
+      transparent: true,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      uniforms: {
+        uTime: { value: 0 },
+        uSuck: { value: 0 },
+        uWarpSpeed: { value: 0 },
+        uPixelRatio: { value: renderer.getPixelRatio() },
+      }
     });
+
     const stars = new THREE.Points(starsGeo, starsMat);
     scene.add(stars);
 
-    // nebula sky
-    const nebulaTex = makeNebulaTexture();
-    let nebula: THREE.Mesh | null = null;
-    if (nebulaTex) {
-      nebula = new THREE.Mesh(
-        new THREE.SphereGeometry(180, 32, 32),
-        new THREE.MeshBasicMaterial({
-          map: nebulaTex, side: THREE.BackSide,
-          transparent: true, opacity: 0.55,
-          depthWrite: false, blending: THREE.AdditiveBlending,
-        }),
-      );
-      scene.add(nebula);
-    }
-
-    // ── animation state ──────────────────────────────────────────────────────
-    const timer = new THREE.Timer();
-    if (typeof document !== "undefined") timer.connect(document);
-
-    let rafId = 0;
+    // ── Animation & Galactic Journey ─────────────────────────────────────────
+    let startTime = Date.now();
+    let enterStartTime = 0;
     let hasEntered = false;
-    let enterAccum = 0;
-    let suckDistanceAccum = 0;
 
-    // Interaction / shaking state
-    let prevStage = stageRef.current;
-    let enteringKick = 0; // 0→1 right after cross event horizon
-    let touchNx = 0;      
-    let touchNy = 0;
-    let touchStrength = 0; 
-    let mouseHover = 0;    
-    let pointerActive = false;
-    let pointerId: number | null = null;
+    const startR = 600;
+    const startY = 180;
+    
+    const midR = 30; 
+    const midY = 6.5; 
+    
+    const endR = 0.05;
 
-    const animate = (timestamp: number) => {
-      rafId = requestAnimationFrame(animate);
-      timer.update(timestamp);
-
-      const s = stageRef.current;
-      if (s !== prevStage) {
-        if (s === "entering") enteringKick = 1;
-        prevStage = s;
-      }
-      // We no longer abort the WebGL render loop during pre-intro!
-      // This forces the shader to compile instantly in the background, eliminating the massive lag spike when clicking 'initialize sequence'.
-      if (s === "home") return; 
-
-      const delta   = timer.getDelta();
-      const elapsed = timer.getElapsed();
-      // smooth decay so motion stays flowy
-      touchStrength = Math.max(0, touchStrength - delta * 1.9);
-      mouseHover    = Math.max(0, mouseHover - delta * 1.35);
-
-      // ── passive orbit (intro) ──────────────────────────────────────────────
-      stars.rotation.y -= delta * 0.012;
-      stars.rotation.x -= delta * 0.004;
-
-      // ── disk / mist physics ────────────────────────────────────────────────
-      // Advanced GLSL GPU Shader replaces all independent CPU array evaluations!
-      let suckMult = 1;
-      if (s === "entering") {
-        const t = Math.min(1, enterAccum / ENTER_SECONDS);
-        suckMult = 1 + easeInCubic(t) * 18; 
-      }
-      suckDistanceAccum += delta * suckMult;
+    const animate = () => {
+      const now = Date.now();
+      const elapsed = (now - startTime) / 1000;
 
       diskMat.uniforms.uTime.value = elapsed;
-      diskMat.uniforms.uSuckDistance.value = suckDistanceAccum;
-      // mist utilizes the exact same diskMat instance natively!
+      starsMat.uniforms.uTime.value = elapsed;
+      warpBubbleMat.uniforms.uTime.value = elapsed;
 
-      disk.rotation.y  += delta * 0.31;
-      disk.rotation.z  += delta * 0.065;
-      mist.rotation.y  -= delta * 0.48;
-      mist.rotation.z  += delta * 0.10;
-      if (nebula) nebula.rotation.y += delta * 0.003;
-      pRing.rotation.y -= delta * 3.5;
+      const s = stageRef.current;
+      const introOrbit = elapsed * 0.03;
 
-      // ── camera / effects for entering ─────────────────────────────────────
       if (s === "entering") {
-        enterAccum += delta;
-        const t  = Math.min(1, enterAccum / ENTER_SECONDS);
-        const e  = easeInOutQuint(t);
-        const kickT = Math.max(0, 1 - t / 0.88);
-        const kick  = enteringKick * kickT;
-
-        // ── camera pull: smoother spiral + softer late snap ─────────────────
-        const phase2 = Math.max(0, (t - 0.52) / 0.48);
-        const snapE  = easeInOutCubic(phase2);
-
-        // Dizzying vortex spin on the Z-axis (Tidal forces returning, but smoothly scaled)
-        const rollAngle = easeInCubic(t / 0.9) * Math.PI * 12.0; 
-        camera.up.set(Math.sin(rollAngle), Math.cos(rollAngle), 0);
-
-        // Keplerian Spiral Dive
-        const tz = easeInOutQuint(t);
-        const plungeRadius = THREE.MathUtils.lerp(15, 0.18, easeOutQuart(tz));
-        const orbitA = elapsed * 0.45 + Math.pow(t, 2.5) * Math.PI * 5.0; // Rapidly escalating orbit speed
-
-        // Seamless bridge from the passive X=3.1/Z=15 viewing ellipse into the pure centered gravity well
-        const xRadius = THREE.MathUtils.lerp(3.1, plungeRadius, e);
-        const zRadius = THREE.MathUtils.lerp(15, plungeRadius, e);
+        if (enterStartTime === 0) enterStartTime = now;
+        const enterElapsed = (now - enterStartTime) / 1000;
+        const t = Math.min(1, enterElapsed / ENTER_SECONDS);
         
-        camera.position.x = Math.sin(orbitA) * xRadius;
-        camera.position.y = THREE.MathUtils.lerp(2 + Math.cos(elapsed * 0.28) * 1.4, 0.05, e) + Math.cos(t * Math.PI * 3.6) * 0.42 * (1 - snapE);
-        camera.position.z = Math.cos(orbitA) * zRadius;
+        const warpPhase = Math.min(1.0, t / 0.45);
+        const warpEased = 1.0 - Math.pow(1.0 - warpPhase, 4.0);
+        const warpSpeed = Math.sin(warpPhase * Math.PI) * 1.5; 
+        
+        const plungePhase = Math.max(0.0, (t - 0.45) / 0.55);
+        const plungeEased = Math.pow(plungePhase, 3.0);
 
-        // The absolute mass of the singularity physically scales out directly into the viewport
-        const horizonScale = 1.0 + Math.pow(t, 14.0) * 1.85;
-        horizon.scale.setScalar(horizonScale);
+        starsMat.uniforms.uWarpSpeed.value = warpSpeed;
+        warpBubbleMat.uniforms.uWarpSpeed.value = warpSpeed;
 
-        // ── Violent camera shake at the precipice ───────────────────────────
-        const interact = Math.max(mouseHover, touchStrength);
-        const shakeBase =
-          kick * 0.038 +
-          interact * 0.032 +
-          Math.pow(t, 8.0) * 1.2; // Massive violent shaking right before the snap
-        if (shakeBase > 0.00005) {
-          const sx = Math.sin(elapsed * 7.1);
-          const sy = Math.cos(elapsed * 8.4);
-          camera.position.x += (sx * 0.11 + touchNx * 0.09) * shakeBase;
-          camera.position.y += (sy * 0.10 + touchNy * 0.08) * shakeBase;
+        const suckVal = Math.pow(plungePhase, 2.0); 
+        diskMat.uniforms.uSuck.value = suckVal;
+        starsMat.uniforms.uSuck.value = suckVal;
+
+        if (warpPhase < 1.0) {
+            const currentR = THREE.MathUtils.lerp(startR, midR, warpEased);
+            camera.position.x = Math.cos(introOrbit) * currentR;
+            camera.position.y = THREE.MathUtils.lerp(startY, midY, warpEased);
+            camera.position.z = Math.sin(introOrbit) * currentR;
+            camera.lookAt(0, 0, 0);
+            
+            camera.fov = 58 + warpSpeed * 12.0;
+            camera.updateProjectionMatrix();
+        } else {
+            const currentR = THREE.MathUtils.lerp(midR, endR, plungeEased);
+            const spinAngle = plungePhase * Math.PI * 8.0; 
+            const orbitOrbit = introOrbit + Math.pow(plungePhase, 3.0) * Math.PI * 4.0;
+            
+            camera.position.x = Math.cos(orbitOrbit) * currentR;
+            camera.position.y = Math.sin(plungePhase * Math.PI) * midY * (1 - plungePhase);
+            camera.position.z = Math.sin(orbitOrbit) * currentR;
+
+            camera.up.set(Math.sin(spinAngle), Math.cos(spinAngle), 0);
+            
+            camera.fov = 58 + Math.pow(plungePhase, 3.0) * 125;
+            camera.updateProjectionMatrix();
+            camera.lookAt(0, 0, 0);
         }
 
-        // ── Hyper FOV warp (Spaghettification suck effect) ─────────────────
-        camera.fov = 55 + easeInCubic(t) * 115; // Ramps out to 170+ FOV drastically!
-        camera.updateProjectionMatrix();
-
-        camera.lookAt(0, 0, 0);
-
-        // ── radial blur / speed overlay ─────────────────────────────────────
-        // Make the “rush” peak earlier so the void snap is visible before
-        // `onEntered` fires and the canvas fades out.
-        const blurRamp = Math.max(0, Math.min(1, (t - 0.06) / 0.62));
-
-        // void pull: align with longer ENTER_SECONDS
-        const voidPull = Math.max(0, Math.min(1, (t - 0.68) / Math.max(1e-6, ENTER_TRIGGER - 0.68)));
-
-        const intensity = easeInOutCubic(blurRamp) * (0.62 + 0.48 * voidPull);
-
-        drawSpeedOverlay(speedCvs, intensity, Math.pow(voidPull, 1.15));
-
-        // CSS blur — capped so transitions stay smooth (heavy blur = jank)
-        const cssBlur = Math.min(7.2, intensity * 6.2 * (0.38 + 0.62 * voidPull));
-        setRendererBlur(renderer.domElement, cssBlur);
-
-        renderer.toneMappingExposure = 1.05 + intensity * 1.55 + voidPull * 0.55;
+        horizon.scale.setScalar(1.0 + Math.pow(plungePhase, 8.0) * 35.0);
+        renderer.toneMappingExposure = Math.max(0.0, 1.05 - Math.pow(plungePhase, 4.0) * 1.05);
 
         if (t >= ENTER_TRIGGER && !hasEntered) {
           hasEntered = true;
           onEnteredRef.current();
         }
+      } else if (s === "expanding" || s === "greeting") {
+        horizon.scale.setScalar(50.0);
+        renderer.toneMappingExposure = 0.0; 
+        
+        diskMat.uniforms.uSuck.value = 1.0;
+        starsMat.uniforms.uSuck.value = 1.0;
+        warpBubbleMat.uniforms.uWarpSpeed.value = 0;
       } else {
-        // ── passive orbit (intro phase) ────────────────────────────────────
-        enterAccum = 0; hasEntered = false;
-        camera.position.x = Math.sin(elapsed * 0.45) * 3.1;
-        camera.position.y = 2 + Math.cos(elapsed * 0.28) * 1.4;
-        camera.position.z = 15;
-        camera.up.set(0, 1, 0); // Restore stable Z axis
-        horizon.scale.setScalar(1.0); // True physics bounds
-        camera.fov = 55;
-        camera.updateProjectionMatrix();
+        enterStartTime = 0;
+        
+        camera.position.x = Math.cos(introOrbit) * startR;
+        camera.position.y = startY + Math.sin(elapsed * 0.05) * 20;
+        camera.position.z = Math.sin(introOrbit) * startR;
+        camera.up.set(0, 1, 0);
         camera.lookAt(0, 0, 0);
+        camera.fov = 58;
+        camera.updateProjectionMatrix();
+
+        diskMat.uniforms.uSuck.value = 0;
+        starsMat.uniforms.uSuck.value = 0;
+        warpBubbleMat.uniforms.uWarpSpeed.value = 0;
+        horizon.scale.setScalar(1);
         renderer.toneMappingExposure = 1.05;
-        drawSpeedOverlay(speedCvs, 0, 0);
-        setRendererBlur(renderer.domElement, 0);
       }
 
       renderer.render(scene, camera);
+      requestAnimationFrame(animate);
     };
-
-    rafId = requestAnimationFrame(animate);
 
     const handleResize = () => {
-      camera.aspect = window.innerWidth / Math.max(window.innerHeight, 1);
+      camera.aspect = window.innerWidth / window.innerHeight;
       camera.updateProjectionMatrix();
       renderer.setSize(window.innerWidth, window.innerHeight);
-      sizeOverlay();
     };
+
     window.addEventListener("resize", handleResize);
-
-    const setPointerFromClient = (e: PointerEvent) => {
-      const nx = (e.clientX / Math.max(1, window.innerWidth) - 0.5) * 2;
-      const ny = (e.clientY / Math.max(1, window.innerHeight) - 0.5) * 2;
-      const near = Math.max(0, 1 - Math.hypot(nx, ny) / 0.85);
-      touchNx = nx;
-      touchNy = ny;
-      // mouse “pointing” — no click required
-      if (e.pointerType === "mouse") {
-        mouseHover = Math.max(mouseHover, near * 0.58);
-      }
-      if (pointerActive && (pointerId === null || e.pointerId === pointerId)) {
-        touchStrength = Math.max(touchStrength, near * 1.18);
-      }
-    };
-
-    const onPointerDown = (e: PointerEvent) => {
-      if (stageRef.current !== "intro" && stageRef.current !== "entering") return;
-      pointerActive = true;
-      pointerId = e.pointerId;
-      setPointerFromClient(e);
-    };
-
-    const onPointerMove = (e: PointerEvent) => {
-      if (stageRef.current !== "intro" && stageRef.current !== "entering") return;
-      setPointerFromClient(e);
-    };
-
-    const onPointerUpOrCancel = (e: PointerEvent) => {
-      if (pointerId !== null && e.pointerId !== pointerId) return;
-      pointerActive = false;
-      pointerId = null;
-    };
-
-    renderer.domElement.style.touchAction = "none";
-    containerRef.current.addEventListener("pointerdown", onPointerDown, { passive: true });
-    containerRef.current.addEventListener("pointermove", onPointerMove, { passive: true });
-    containerRef.current.addEventListener("pointerup", onPointerUpOrCancel, { passive: true });
-    containerRef.current.addEventListener("pointercancel", onPointerUpOrCancel, { passive: true });
+    animate();
 
     return () => {
       window.removeEventListener("resize", handleResize);
-      containerRef.current?.removeEventListener("pointerdown", onPointerDown);
-      containerRef.current?.removeEventListener("pointermove", onPointerMove);
-      containerRef.current?.removeEventListener("pointerup", onPointerUpOrCancel);
-      containerRef.current?.removeEventListener("pointercancel", onPointerUpOrCancel);
-      cancelAnimationFrame(rafId);
-      timer.dispose();
-      if (nebulaTex) nebulaTex.dispose();
-      // dispose geometries / materials
-      [diskGeo, mistGeo, starsGeo, ringGeo].forEach(g => g.dispose());
-      [diskMat, starsMat].forEach(m => m.dispose());
-      horizon.geometry.dispose(); (horizon.material as THREE.Material).dispose();
-      if (nebula) { nebula.geometry.dispose(); (nebula.material as THREE.Material).dispose(); }
       renderer.dispose();
-      renderer.domElement.remove();
-      speedCvs.remove();
+      diskGeo.dispose();
+      diskMat.dispose();
+      horizonGeo.dispose();
+      horizonMat.dispose();
+      starsGeo.dispose();
+      starsMat.dispose();
+      warpBubbleGeo.dispose();
+      warpBubbleMat.dispose();
+      containerRef.current?.removeChild(renderer.domElement);
     };
   }, []);
 
-  return (
-    // pointer events are enabled for touch-driven particle pushing/shaking
-    // (no cursor-pointer styling; keep normal cursor)
-    <div ref={containerRef} className="relative h-full w-full cursor-default" />
-  );
+  return <div ref={containerRef} className="h-full w-full" />;
 }
