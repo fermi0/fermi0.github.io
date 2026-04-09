@@ -1,5 +1,4 @@
 import type { Metadata } from "next";
-import SiteChrome from "@/components/site/SiteChrome";
 import BlogPageContent from "@/components/site/BlogPageContent";
 
 export const metadata: Metadata = {
@@ -9,10 +8,8 @@ export const metadata: Metadata = {
 
 export default function BlogPage() {
   return (
-    <SiteChrome>
-      <main className="mx-auto w-full max-w-5xl flex-1 px-6 py-12 md:px-12">
-        <BlogPageContent />
-      </main>
-    </SiteChrome>
+    <main className="mx-auto w-full max-w-5xl flex-1 px-6 py-12 md:px-12">
+      <BlogPageContent />
+    </main>
   );
 }

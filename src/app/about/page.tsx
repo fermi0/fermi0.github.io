@@ -1,5 +1,4 @@
 import type { Metadata } from "next";
-import SiteChrome from "@/components/site/SiteChrome";
 import AboutPageContent from "@/components/site/AboutPageContent";
 
 export const metadata: Metadata = {
@@ -9,10 +8,8 @@ export const metadata: Metadata = {
 
 export default function AboutPage() {
   return (
-    <SiteChrome>
-      <main className="mx-auto flex w-full max-w-4xl flex-1 flex-col justify-center px-6 py-12 md:px-12">
-        <AboutPageContent />
-      </main>
-    </SiteChrome>
+    <main className="mx-auto flex w-full max-w-4xl flex-1 flex-col justify-center px-6 py-12 md:px-12">
+      <AboutPageContent />
+    </main>
   );
 }
