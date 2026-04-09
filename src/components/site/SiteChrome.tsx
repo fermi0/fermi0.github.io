@@ -14,7 +14,7 @@ export default function SiteChrome({ children }: { children: ReactNode }) {
   const pathname = usePathname();
 
   return (
-    <div className="flex min-h-screen flex-col bg-[#1d2021] font-sans text-[#ebdbb2] selection:bg-[#fabd2f] selection:text-[#1d2021]">
+    <div className="flex min-h-screen flex-col">
       <header className="flex items-center justify-between px-6 py-8 opacity-80 transition-opacity duration-500 hover:opacity-100 md:px-12 md:py-10">
         <Link
           href="/"
